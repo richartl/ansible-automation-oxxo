@@ -1,0 +1,196 @@
+---
+- name: Startup Oracle 11g XE (startup) + optional listener start + postcheck PMON
+  hosts: oracle_hosts
+  gather_facts: true
+
+  vars:
+    oracle_sid: "XE"
+    oracle_home: "/u01/app/oracle/product/11.2.0/xe"
+    oracle_user: "oracle"
+
+    start_listener: true
+    listener_name: "LISTENER"
+
+    # Log en HOME/logs (fallback /tmp)
+    log_dir_primary: "{{ ansible_env.HOME | default('/home/' ~ oracle_user) }}/logs"
+    log_dir_fallback: "/tmp"
+
+  tasks:
+    - name: "Calcular rutas de log"
+      ansible.builtin.set_fact:
+        log_file_primary: "{{ log_dir_primary }}/startup_{{ oracle_sid }}_{{ ansible_date_time.date | regex_replace('-', '') }}_{{ ansible_date_time.time | regex_replace(':', '') }}.log"
+        log_file_fallback: "{{ log_dir_fallback }}/startup_{{ oracle_sid }}_{{ ansible_date_time.date | regex_replace('-', '') }}_{{ ansible_date_time.time | regex_replace(':', '') }}.log"
+
+    - name: "Crear log_dir primario (si se puede)"
+      ansible.builtin.file:
+        path: "{{ log_dir_primary }}"
+        state: directory
+        mode: "0755"
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: logdir_primary_result
+      failed_when: false
+
+    - name: "Elegir log_file final (fallback a /tmp si no se pudo crear HOME/logs)"
+      ansible.builtin.set_fact:
+        log_file: >-
+          {{
+            (logdir_primary_result is defined and (logdir_primary_result.failed | default(false)) == false)
+            | ternary(log_file_primary, log_file_fallback)
+          }}
+
+    - name: "Escribir header de inicio en log"
+      ansible.builtin.shell: |
+        {
+          echo "[$(date)] Iniciando arranque Oracle 11g XE - SID={{ oracle_sid }}";
+          echo "[$(date)] Log: {{ log_file }}";
+        } >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+
+    - name: "Precheck PMON (si ya está arriba, no correr startup)"
+      ansible.builtin.shell: |
+        ps -ef | grep -v grep | grep -E -c "(ora|xe)_pmon_{{ oracle_sid }}" || true
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: pmon_before
+
+    - name: "Log: PMON antes"
+      ansible.builtin.shell: |
+        echo "[$(date)] PMON_COUNT_BEFORE={{ pmon_before.stdout | default('0') }}" >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+
+    - name: "Log: instancia ya arriba"
+      ansible.builtin.shell: |
+        echo "[$(date)] La instancia ya está arriba (PMON encontrado)." >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      when: (pmon_before.stdout | int) > 0
+
+    - name: "Ejecutar startup (solo si no hay PMON)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export ORACLE_SID="{{ oracle_sid }}"
+        export ORACLE_HOME="{{ oracle_home }}"
+        export PATH="{{ oracle_home }}/bin:$PATH"
+
+        sqlplus -s / as sysdba <<'SQL'
+        whenever sqlerror exit 1;
+        startup;
+        exit;
+        SQL
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: startup_sql
+      when: (pmon_before.stdout | int) == 0
+
+    - name: "Guardar salida de startup en log"
+      ansible.builtin.shell: |
+        {
+          echo "[$(date)] Ejecutando startup...";
+          echo "----- sqlplus output (startup) -----";
+          cat <<'OUT'
+        {{ startup_sql.stdout | default('') }}
+        OUT
+          echo "----- end output -----";
+          echo "[$(date)] rc_startup={{ startup_sql.rc | default(999) }}";
+        } >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      when: (pmon_before.stdout | int) == 0
+
+    - name: "Fallar si startup falló"
+      ansible.builtin.fail:
+        msg: >-
+          ERROR: startup falló (rc={{ startup_sql.rc }}).
+          Revisa el log: {{ log_file }}
+      when:
+        - (pmon_before.stdout | int) == 0
+        - (startup_sql.rc | int) != 0
+
+    - name: "Log: startup exitoso"
+      ansible.builtin.shell: |
+        echo "[$(date)] startup exitoso" >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      when:
+        - (pmon_before.stdout | int) == 0
+        - (startup_sql.rc | int) == 0
+
+    - name: "Levantar listener (opcional)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export ORACLE_HOME="{{ oracle_home }}"
+        export PATH="{{ oracle_home }}/bin:$PATH"
+        lsnrctl start "{{ listener_name }}" >> "{{ log_file }}" 2>&1
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: listener_start_result
+      failed_when: false   # WARNING si falla, como tu script
+      when: start_listener | bool
+
+    - name: "Log: resultado listener start"
+      ansible.builtin.shell: |
+        if [ "{{ (listener_start_result.rc | default(0)) | int }}" -ne 0 ]; then
+          echo "[$(date)] WARNING: no pude levantar listener (revisa nombre o estado)" >> "{{ log_file }}"
+        else
+          echo "[$(date)] Listener levantado" >> "{{ log_file }}"
+        fi
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      when: start_listener | bool
+
+    - name: "Postcheck PMON (debe quedar arriba)"
+      ansible.builtin.shell: |
+        ps -ef | grep -v grep | grep -E -c "(ora|xe)_pmon_{{ oracle_sid }}" || true
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: pmon_after
+
+    - name: "Log: PMON después"
+      ansible.builtin.shell: |
+        echo "[$(date)] PMON_COUNT_AFTER={{ pmon_after.stdout | default('0') }}" >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+
+    - name: "Fallar si no hay PMON después del startup"
+      ansible.builtin.fail:
+        msg: >-
+          ERROR: No se detecta PMON después del startup.
+          Revisa el log: {{ log_file }}
+      when: (pmon_after.stdout | int) == 0
+
+    - name: "Log: arranque completado"
+      ansible.builtin.shell: |
+        echo "[$(date)] Arranque completado" >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+
+    - name: "Mostrar ruta de log en la salida del job"
+      ansible.builtin.debug:
+        msg: "Arranque completado. Log: {{ log_file }}"

@@ -1,0 +1,194 @@
+---
+- name: Shutdown Oracle 11g XE (immediate -> abort fallback) + optional listener stop
+  hosts: oracle_hosts
+  gather_facts: true
+
+  vars:
+    oracle_sid: "XE"
+    oracle_home: "/u01/app/oracle/product/11.2.0/xe"
+    oracle_user: "oracle"
+
+    stop_listener: true
+    listener_name: "LISTENER"
+
+    # Log en HOME/logs (fallback /tmp)
+    log_dir_primary: "{{ ansible_env.HOME | default('/home/' ~ oracle_user) }}/logs"
+    log_dir_fallback: "/tmp"
+
+  tasks:
+    - name: "Calcular rutas de log"
+      ansible.builtin.set_fact:
+        log_timestamp: "{{ ansible_date_time.date | regex_replace('-', '') }}_{{ ansible_date_time.time | regex_replace(':', '') }}"
+        log_file_primary: "{{ log_dir_primary }}/shutdown_{{ oracle_sid }}_{{ ansible_date_time.date | regex_replace('-', '') }}_{{ ansible_date_time.time | regex_replace(':', '') }}.log"
+        log_file_fallback: "{{ log_dir_fallback }}/shutdown_{{ oracle_sid }}_{{ ansible_date_time.date | regex_replace('-', '') }}_{{ ansible_date_time.time | regex_replace(':', '') }}.log"
+
+    - name: "Crear log_dir primario (si se puede)"
+      ansible.builtin.file:
+        path: "{{ log_dir_primary }}"
+        state: directory
+        mode: "0755"
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: logdir_primary_result
+      failed_when: false
+
+    - name: "Elegir log_file final (fallback a /tmp si no se pudo crear HOME/logs)"
+      ansible.builtin.set_fact:
+        log_file: >-
+          {{
+            (logdir_primary_result is defined and (logdir_primary_result.failed | default(false)) == false)
+            | ternary(log_file_primary, log_file_fallback)
+          }}
+
+    - name: "Escribir header de inicio en log"
+      ansible.builtin.shell: |
+        {
+          echo "[$(date)] Iniciando apagado Oracle 11g XE - SID={{ oracle_sid }}";
+          echo "[$(date)] Log: {{ log_file }}";
+        } >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+
+    - name: "Precheck PMON (si no está, ya está abajo)"
+      ansible.builtin.shell: |
+        ps -ef | grep -v grep | grep -E -c "(ora|xe)_pmon_{{ oracle_sid }}" || true
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: pmon_count
+
+    - name: "Log: PMON count"
+      ansible.builtin.shell: |
+        echo "[$(date)] PMON_COUNT={{ pmon_count.stdout | default('0') }}" >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+
+    - name: "Salir si la instancia ya está abajo"
+      ansible.builtin.meta: end_play
+      when: (pmon_count.stdout | int) == 0
+
+    - name: "Intentar shutdown immediate"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export ORACLE_SID="{{ oracle_sid }}"
+        export ORACLE_HOME="{{ oracle_home }}"
+        export PATH="{{ oracle_home }}/bin:$PATH"
+
+        sqlplus -s / as sysdba <<'SQL'
+        whenever sqlerror exit 1;
+        shutdown immediate;
+        exit;
+        SQL
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: shutdown_imm
+      failed_when: false  # no truena el play; evaluamos y hacemos fallback
+      changed_when: true
+
+    - name: "Guardar salida de shutdown immediate en log"
+      ansible.builtin.shell: |
+        {
+          echo "[$(date)] Ejecutando shutdown immediate...";
+          echo "----- sqlplus output (immediate) -----";
+          cat <<'OUT'
+        {{ shutdown_imm.stdout | default('') }}
+        OUT
+          echo "----- end output -----";
+          echo "[$(date)] rc_immediate={{ shutdown_imm.rc | default(999) }}";
+        } >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+
+    - name: "Fallback: shutdown abort si immediate falló"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export ORACLE_SID="{{ oracle_sid }}"
+        export ORACLE_HOME="{{ oracle_home }}"
+        export PATH="{{ oracle_home }}/bin:$PATH"
+
+        sqlplus -s / as sysdba <<'SQL'
+        whenever sqlerror exit 1;
+        shutdown abort;
+        exit;
+        SQL
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: shutdown_abt
+      when: (shutdown_imm.rc | int) != 0
+
+    - name: "Guardar salida de shutdown abort en log"
+      ansible.builtin.shell: |
+        {
+          echo "[$(date)] shutdown immediate falló, ejecutando shutdown abort...";
+          echo "----- sqlplus output (abort) -----";
+          cat <<'OUT'
+        {{ shutdown_abt.stdout | default('') }}
+        OUT
+          echo "----- end output -----";
+          echo "[$(date)] rc_abort={{ shutdown_abt.rc | default(999) }}";
+        } >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      when: (shutdown_imm.rc | int) != 0
+
+    - name: "Fallar si immediate falló y abort también falló"
+      ansible.builtin.fail:
+        msg: >-
+          ERROR: shutdown immediate falló (rc={{ shutdown_imm.rc }}),
+          y shutdown abort también falló (rc={{ shutdown_abt.rc }}).
+          Revisa el log: {{ log_file }}
+      when:
+        - (shutdown_imm.rc | int) != 0
+        - (shutdown_abt.rc | int) != 0
+
+    - name: "Detener listener (opcional)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export ORACLE_HOME="{{ oracle_home }}"
+        export PATH="{{ oracle_home }}/bin:$PATH"
+        lsnrctl stop "{{ listener_name }}" >> "{{ log_file }}" 2>&1
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      register: listener_stop
+      failed_when: false   # WARNING si falla, igual que tu script
+      when: stop_listener | bool
+
+    - name: "Log: resultado listener stop"
+      ansible.builtin.shell: |
+        if [ "{{ (listener_stop.rc | default(0)) | int }}" -ne 0 ]; then
+          echo "[$(date)] WARNING: no pude detener listener (quizá ya estaba abajo o no existe en XE)" >> "{{ log_file }}"
+        else
+          echo "[$(date)] Listener detenido" >> "{{ log_file }}"
+        fi
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+      when: stop_listener | bool
+
+    - name: "Log: apagado completado"
+      ansible.builtin.shell: |
+        echo "[$(date)] Apagado completado" >> "{{ log_file }}"
+      args:
+        executable: /bin/bash
+      become: true
+      become_user: "{{ oracle_user }}"
+
+    - name: "Mostrar ruta de log en la salida del job"
+      ansible.builtin.debug:
+        msg: "Apagado completado. Log: {{ log_file }}"
